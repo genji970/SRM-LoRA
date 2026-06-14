@@ -1,0 +1,16 @@
+# Ignore everything by default.
+*
+
+# Keep this ignore file.
+!.gitignore
+
+# Allow Git to traverse directories.
+!*/
+
+# Track Python and shell source files.
+!*.py
+!*.sh
+!*.txt
+
+# Track only comparison.json files under outputs.
+!outputs/**/comparison.json
