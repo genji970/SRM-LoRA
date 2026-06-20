@@ -14,6 +14,4 @@ python -m main
 
 bash run_sr_ablation.sh
 
-bash run_sr_ablation_2.sh
-
 bash run_add.sh
