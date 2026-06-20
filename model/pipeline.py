@@ -153,8 +153,8 @@ class TrainingHallucinationJudge:
                 model_name,
                 **self.model_kwargs,
             )
-            model.eval()
             setattr(self, model_attr, model)
+        model.eval()
 
         inputs = tokenizer(
             list(prompts),

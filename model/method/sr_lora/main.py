@@ -37,7 +37,8 @@ class SubRiemannianLora(ContrastiveLora):
         self.lookahead_lr = float(self.env.get("SR_LOOKAHEAD_LR", self.env.get("TRAIN_LR", "1e-5")))
         self.lookahead_margin = float(self.env.get("SR_LOOKAHEAD_MARGIN", "0.0"))
         self.lookahead_every = max(1, int(self.env.get("SR_LOOKAHEAD_EVERY", "1")))
-        self.lookahead_max_samples = max(1, int(self.env.get("SR_LOOKAHEAD_MAX_SAMPLES", "2")))
+        self.lookahead_max_samples = max(1, int(self.env.get("SR_LOOKAHEAD_MAX_SAMPLES", "128")))
+        self.lookahead_chunk_size = max(1, int(self.env.get("SR_LOOKAHEAD_CHUNK_SIZE", "2")))
         self._current_contrast_grads: dict[int, Any] = {}
         self._previous_boundary: dict[int, dict[str, Any]] = {}
         self._lookahead_batches: list[tuple[Any, tuple[Any, ...]]] = []
@@ -481,6 +482,7 @@ class SubRiemannianLora(ContrastiveLora):
         return loss, {
             "active": True,
             "probe_samples": len(samples),
+            "chunk_size": self.lookahead_chunk_size,
             "plain_gold_ce": self.float_or_none(plain_parts["gold_ce"]),
             "masked_gold_ce": self.float_or_none(masked_parts["gold_ce"]),
             "plain_hall_ce": self.float_or_none(plain_parts["hall_ce"]),
@@ -515,6 +517,7 @@ class SubRiemannianLora(ContrastiveLora):
             answer_attr="answer",
             param_name=param_name,
             updated_param=updated_param,
+            chunk_size=self.lookahead_chunk_size,
         )
         hall_samples = tuple(sample for sample in samples if getattr(sample, "hallucinated_answer", ""))
         hall_ce = None
@@ -527,6 +530,7 @@ class SubRiemannianLora(ContrastiveLora):
                 answer_attr="hallucinated_answer",
                 param_name=param_name,
                 updated_param=updated_param,
+                chunk_size=self.lookahead_chunk_size,
             )
             objective = objective - hall_ce
         return objective, {"gold_ce": gold_ce, "hall_ce": hall_ce}
@@ -539,25 +543,36 @@ class SubRiemannianLora(ContrastiveLora):
         answer_attr: str,
         param_name: str,
         updated_param: Any,
+        chunk_size: int = 2,
     ) -> Any:
         import torch.nn.functional as F
         from torch.func import functional_call
 
-        batch = loss_fn.build_lm_batch(samples, answer_attr)
-        batch = {key: value.to(updated_param.device) for key, value in batch.items()}
-        logits = functional_call(
-            model,
-            {param_name: updated_param},
-            (),
-            {"input_ids": batch["input_ids"], "attention_mask": batch["attention_mask"]},
-        ).logits
-        shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = batch["labels"][:, 1:].contiguous()
-        return F.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1),
-            ignore_index=-100,
-        )
+        total_loss = updated_param.new_tensor(0.0, dtype=updated_param.float().dtype)
+        total_tokens = updated_param.new_tensor(0.0, dtype=updated_param.float().dtype)
+        chunk_size = max(1, int(chunk_size))
+        for start in range(0, len(samples), chunk_size):
+            chunk = samples[start : start + chunk_size]
+            if not chunk:
+                continue
+            batch = loss_fn.build_lm_batch(chunk, answer_attr)
+            batch = {key: value.to(updated_param.device) for key, value in batch.items()}
+            logits = functional_call(
+                model,
+                {param_name: updated_param},
+                (),
+                {"input_ids": batch["input_ids"], "attention_mask": batch["attention_mask"]},
+            ).logits
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = batch["labels"][:, 1:].contiguous()
+            total_loss = total_loss + F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+                reduction="sum",
+            )
+            total_tokens = total_tokens + shift_labels.ne(-100).sum().to(device=total_tokens.device, dtype=total_tokens.dtype)
+        return total_loss / total_tokens.clamp_min(1.0)
 
     def prepare_visualization_dir(self) -> None:
         if not self.visualization_enabled:

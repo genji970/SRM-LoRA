@@ -196,12 +196,17 @@ class Trainer:
 
         try:
             print(f"[train] eval start step={step}", flush=True)
+            # Always force evaluation mode for every eval path.
+            # This covers both eval_loss=True and eval_loss=False; without this,
+            # comparison generation could run with dropout/training behavior enabled.
+            model.eval()
             if self.env.get("EVAL_LOSS", "true").lower() in {"true", "1", "yes"}:
                 eval_loss = self.evaluate(model, tokenizer, loss_fn)
                 if eval_loss is not None:
                     print(f"step={step} eval_loss={eval_loss:.4f}", flush=True)
             else:
                 print(f"[eval_loss] skipped EVAL_LOSS={self.env.get('EVAL_LOSS')}", flush=True)
+            model.eval()
             comparison = self.compare_eval(step)
             if comparison is not None:
                 print(f"step={step} comparison={comparison['summary']}", flush=True)
@@ -313,7 +318,6 @@ class Trainer:
                     f"[eval_loss] batch={batch_index} samples={start}-{end}/{total} loss={batch_loss:.4f}",
                     flush=True,
                 )
-        model.train()
         eval_loss = sum(losses) / len(losses) if losses else None
         print(f"[eval_loss] done batches={len(losses)} loss={eval_loss}", flush=True)
         return eval_loss

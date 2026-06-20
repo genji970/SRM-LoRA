@@ -93,6 +93,7 @@ class Evaluator:
         if not samples:
             return []
         model = self.pipeline.load_model()
+        model.eval()
         tokenizer = self.pipeline.load_tokenizer()
         prompts = [EvalAnswerJudge.base_prompt(sample) for sample in samples]
         inputs = tokenizer(
