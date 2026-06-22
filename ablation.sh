@@ -20,7 +20,7 @@ RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 
 RUN_MAIN="${RUN_MAIN:-false}"
 RUN_JUDGE_ABLATION="${RUN_JUDGE_ABLATION:-false}"
-RUN_BASE_MODEL_ABLATION="${RUN_BASE_MODEL_ABLATION:-true}"
+RUN_BASE_MODEL_ABLATION="${RUN_BASE_MODEL_ABLATION:-false}"
 RUN_SEED_ABLATION="${RUN_SEED_ABLATION:-true}"
 RUN_MASKING_ABLATION="${RUN_MASKING_ABLATION:-true}"
 
@@ -37,7 +37,7 @@ MAIN_SEED="${MAIN_SEED:-42}"
 # Use the names accepted by Pipeline.EVAL_SOURCES.
 # fullwiki == hotpotqa_fullwiki, summ == summarization.
 MAIN_EVAL_DATASETS="${MAIN_EVAL_DATASETS:-drop hotpotqa_fullwiki dialogue summarization}"
-MASKING_EVAL_DATASETS="${MASKING_EVAL_DATASETS:-drop hotpotqa_fullwiki}"
+MASKING_EVAL_DATASETS="${MASKING_EVAL_DATASETS:-drop}"
 DROP_ONLY_EVAL_DATASET="${DROP_ONLY_EVAL_DATASET:-drop}"
 
 # Judge ablation: Qwen is deliberately excluded. Only one Gemma family entry is used.
@@ -49,7 +49,7 @@ JUDGE_MODELS="${JUDGE_MODELS//,/ }"
 BASE_MODELS="${BASE_MODELS:-meta-llama/Llama-3.1-8B-Instruct HuggingFaceH4/zephyr-7b-beta google/gemma-7b-it}"
 BASE_MODELS="${BASE_MODELS//,/ }"
 
-SEED_LIST="${SEED_LIST:-40 41 42 43 44 20 21 22 23 24}"
+SEED_LIST="${SEED_LIST:-20 21 22 23 24}"
 SEED_LIST="${SEED_LIST//,/ }"
 
 # Keep base env defaults unless these are explicitly overridden when launching this script.
