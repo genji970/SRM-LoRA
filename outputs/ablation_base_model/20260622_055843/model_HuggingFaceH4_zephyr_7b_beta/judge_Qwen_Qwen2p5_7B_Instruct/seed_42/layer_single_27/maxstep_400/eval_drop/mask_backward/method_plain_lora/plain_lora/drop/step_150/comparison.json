@@ -1,0 +1,16 @@
+{
+  "summary": {
+    "evaluated": 9535,
+    "frozen_base_correct": 5059,
+    "method_correct": 5284,
+    "frozen_base_incorrect": 4476,
+    "method_incorrect": 4251,
+    "frozen_base_hallucination_rate": 0.46942842160461457,
+    "method_hallucination_rate": 0.44583114840062926,
+    "improved": 1561,
+    "worsened": 1336,
+    "net_improved": 225
+  },
+  "samples_path": "outputs/ablation_base_model/20260622_055843/model_HuggingFaceH4_zephyr_7b_beta/judge_Qwen_Qwen2p5_7B_Instruct/seed_42/layer_single_27/maxstep_400/eval_drop/mask_backward/method_plain_lora/plain_lora/drop/step_150/comparison_samples.jsonl",
+  "samples_format": "jsonl"
+}

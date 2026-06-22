@@ -39,6 +39,9 @@ class SubRiemannianLora(ContrastiveLora):
         self.lookahead_every = max(1, int(self.env.get("SR_LOOKAHEAD_EVERY", "1")))
         self.lookahead_max_samples = max(1, int(self.env.get("SR_LOOKAHEAD_MAX_SAMPLES", "128")))
         self.lookahead_chunk_size = max(1, int(self.env.get("SR_LOOKAHEAD_CHUNK_SIZE", "2")))
+        self.mask_placement = self.env.get("SR_MASK_PLACEMENT", self.env.get("SR_MASK_MODE", "backward")).strip().lower()
+        if self.mask_placement not in {"backward", "forward"}:
+            raise ValueError(f"SR_MASK_PLACEMENT must be backward or forward, got {self.mask_placement}")
         self._current_contrast_grads: dict[int, Any] = {}
         self._previous_boundary: dict[int, dict[str, Any]] = {}
         self._lookahead_batches: list[tuple[Any, tuple[Any, ...]]] = []
@@ -180,7 +183,9 @@ class SubRiemannianLora(ContrastiveLora):
         metric_diag = self.metric_for_update(module.sr_metric_raw, x_unit)
         inv_metric = metric_diag.reciprocal()
 
-        if weight.grad is not None:
+        if self.mask_placement == "forward":
+            self.update_forward_mask(module, inv_metric)
+        elif self.mask_placement == "backward" and weight.grad is not None:
             preconditioned = (weight.grad.detach().float() * inv_metric).to(dtype=weight.grad.dtype)
             weight.grad.copy_(preconditioned)
 
@@ -211,6 +216,7 @@ class SubRiemannianLora(ContrastiveLora):
         row = {
             "active": True,
             "name": name,
+            "mask_placement": self.mask_placement,
             "shape": list(weight.shape),
             "soft_mask": mask_stats,
             "d_weight_norm": self.norm(delta_weight),
@@ -258,15 +264,72 @@ class SubRiemannianLora(ContrastiveLora):
                     "sr_metric_raw",
                     torch.nn.Parameter(torch.zeros(shape, device=module.weight.device, dtype=torch.float32)),
                 )
-            print(f"[sr_lora] attached elementwise metric to {name} shape={shape}", flush=True)
+            if self.mask_placement == "forward":
+                self.ensure_forward_mask_buffer(module, shape)
+                self.attach_forward_mask(module)
+            print(f"[sr_lora] attached elementwise metric to {name} shape={shape} mask_placement={self.mask_placement}", flush=True)
 
         print(
             "[sr_lora] active elementwise metrics="
             f"{len(targets)} modules={self.target_modules_label()} layers={self.target_layers_label()} "
             f"layer_indices={self.target_layer_indices_label()} include_mlp={self.include_mlp} "
-            f"include_attn={self.include_attn}",
+            f"include_attn={self.include_attn} mask_placement={self.mask_placement}",
             flush=True,
         )
+
+
+    def ensure_forward_mask_buffer(self, module: Any, shape: tuple[int, ...]) -> None:
+        import torch
+
+        current = getattr(module, "sr_forward_mask", None)
+        if current is not None and tuple(current.shape) != tuple(shape):
+            del module._buffers["sr_forward_mask"]
+            current = None
+        if current is None:
+            module.register_buffer(
+                "sr_forward_mask",
+                torch.ones(shape, device=module.weight.device, dtype=torch.float32),
+                persistent=False,
+            )
+
+    def attach_forward_mask(self, module: Any) -> None:
+        if getattr(module, "_sr_forward_mask_wrapped", False):
+            return
+
+        import types
+        import torch.nn.functional as F
+
+        original_forward = module.forward
+
+        def sr_forward_masked(inner_self: Any, input: Any) -> Any:
+            mask = getattr(inner_self, "sr_forward_mask", None)
+            if mask is None:
+                return original_forward(input)
+            weight = inner_self.weight
+            masked_weight = weight * mask.to(device=weight.device, dtype=weight.dtype)
+            bias = getattr(inner_self, "bias", None)
+            return F.linear(input, masked_weight, bias)
+
+        module.forward = types.MethodType(sr_forward_masked, module)
+        module._sr_forward_mask_wrapped = True
+
+    @staticmethod
+    def update_forward_mask(module: Any, mask: Any) -> None:
+        import torch
+
+        target = mask.detach().float()
+        current = getattr(module, "sr_forward_mask", None)
+        if current is None or tuple(current.shape) != tuple(target.shape):
+            if current is not None:
+                del module._buffers["sr_forward_mask"]
+            module.register_buffer(
+                "sr_forward_mask",
+                torch.ones_like(target, device=module.weight.device, dtype=torch.float32),
+                persistent=False,
+            )
+            current = module.sr_forward_mask
+        with torch.no_grad():
+            current.copy_(target.to(device=current.device, dtype=current.dtype))
 
     def target_lora_b_modules(self, model: Any) -> list[tuple[str, Any]]:
         candidates = [
@@ -610,6 +673,7 @@ class SubRiemannianLora(ContrastiveLora):
                     "SR_METRIC_MIN": self.env.get("SR_METRIC_MIN"),
                     "SR_METRIC_MAX": self.env.get("SR_METRIC_MAX"),
                     "SR_METRIC_GAIN": self.env.get("SR_METRIC_GAIN"),
+                    "SR_MASK_PLACEMENT": self.env.get("SR_MASK_PLACEMENT"),
                 },
             },
         )
