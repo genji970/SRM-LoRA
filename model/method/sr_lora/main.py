@@ -39,6 +39,9 @@ class SubRiemannianLora(ContrastiveLora):
         self.lookahead_every = max(1, int(self.env.get("SR_LOOKAHEAD_EVERY", "1")))
         self.lookahead_max_samples = max(1, int(self.env.get("SR_LOOKAHEAD_MAX_SAMPLES", "128")))
         self.lookahead_chunk_size = max(1, int(self.env.get("SR_LOOKAHEAD_CHUNK_SIZE", "2")))
+        self.lookahead_sync_dropout_rng = self.bool_value(
+            self.env.get("SR_LOOKAHEAD_SYNC_DROPOUT_RNG", "true")
+        )
         self.mask_placement = self.env.get("SR_MASK_PLACEMENT", self.env.get("SR_MASK_MODE", "backward")).strip().lower()
         if self.mask_placement not in {"backward", "forward"}:
             raise ValueError(f"SR_MASK_PLACEMENT must be backward or forward, got {self.mask_placement}")
@@ -524,21 +527,49 @@ class SubRiemannianLora(ContrastiveLora):
         plain_param = weight - self.lookahead_lr * update.to(device=weight.device, dtype=weight.dtype)
         masked_param = weight - self.lookahead_lr * masked_update.to(device=weight.device, dtype=weight.dtype)
 
-        with torch.no_grad():
-            plain_objective, plain_parts = self.lookahead_objective(
+        if self.lookahead_sync_dropout_rng:
+            outer_rng_state = self.capture_rng_state()
+            try:
+                # Compare plain vs. masked candidates under the exact same
+                # CPU/CUDA dropout RNG stream.
+                self.restore_rng_state(outer_rng_state)
+                with torch.no_grad():
+                    plain_objective, plain_parts = self.lookahead_objective(
+                        model=model,
+                        loss_fn=loss_fn,
+                        samples=samples,
+                        param_name=param_name,
+                        updated_param=plain_param,
+                    )
+
+                self.restore_rng_state(outer_rng_state)
+                masked_objective, masked_parts = self.lookahead_objective(
+                    model=model,
+                    loss_fn=loss_fn,
+                    samples=samples,
+                    param_name=param_name,
+                    updated_param=masked_param,
+                )
+            finally:
+                # SR-only probe forwards must not advance the RNG stream used
+                # by subsequent real training forwards.
+                self.restore_rng_state(outer_rng_state)
+        else:
+            with torch.no_grad():
+                plain_objective, plain_parts = self.lookahead_objective(
+                    model=model,
+                    loss_fn=loss_fn,
+                    samples=samples,
+                    param_name=param_name,
+                    updated_param=plain_param,
+                )
+            masked_objective, masked_parts = self.lookahead_objective(
                 model=model,
                 loss_fn=loss_fn,
                 samples=samples,
                 param_name=param_name,
-                updated_param=plain_param,
+                updated_param=masked_param,
             )
-        masked_objective, masked_parts = self.lookahead_objective(
-            model=model,
-            loss_fn=loss_fn,
-            samples=samples,
-            param_name=param_name,
-            updated_param=masked_param,
-        )
         objective_delta = masked_objective - plain_objective.detach()
         loss = F.softplus(objective_delta + self.lookahead_margin)
         gain = plain_objective.detach() - masked_objective.detach()
@@ -557,6 +588,27 @@ class SubRiemannianLora(ContrastiveLora):
             "loss": self.scalar(loss.detach()),
             "margin": self.lookahead_margin,
         }
+
+    @staticmethod
+    def capture_rng_state() -> dict[str, Any]:
+        import torch
+
+        state: dict[str, Any] = {
+            "cpu": torch.get_rng_state().clone(),
+            "cuda": None,
+        }
+        if torch.cuda.is_available():
+            state["cuda"] = [rng.clone() for rng in torch.cuda.get_rng_state_all()]
+        return state
+
+    @staticmethod
+    def restore_rng_state(state: Mapping[str, Any]) -> None:
+        import torch
+
+        torch.set_rng_state(state["cpu"])
+        cuda_states = state.get("cuda")
+        if cuda_states is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(cuda_states)
 
     def lookahead_probe_batch(self) -> tuple[Any, tuple[Any, ...]] | None:
         if not self._lookahead_batches:
@@ -673,6 +725,7 @@ class SubRiemannianLora(ContrastiveLora):
                     "SR_METRIC_MIN": self.env.get("SR_METRIC_MIN"),
                     "SR_METRIC_MAX": self.env.get("SR_METRIC_MAX"),
                     "SR_METRIC_GAIN": self.env.get("SR_METRIC_GAIN"),
+                    "SR_LOOKAHEAD_SYNC_DROPOUT_RNG": self.env.get("SR_LOOKAHEAD_SYNC_DROPOUT_RNG", "true"),
                     "SR_MASK_PLACEMENT": self.env.get("SR_MASK_PLACEMENT"),
                 },
             },
@@ -902,6 +955,7 @@ class SrElementMetricDebugRecorder:
                         "SR_LOOKAHEAD_MARGIN": self.env.get("SR_LOOKAHEAD_MARGIN"),
                         "SR_LOOKAHEAD_EVERY": self.env.get("SR_LOOKAHEAD_EVERY"),
                         "SR_LOOKAHEAD_MAX_SAMPLES": self.env.get("SR_LOOKAHEAD_MAX_SAMPLES"),
+                        "SR_LOOKAHEAD_SYNC_DROPOUT_RNG": self.env.get("SR_LOOKAHEAD_SYNC_DROPOUT_RNG", "true"),
                     },
                 },
             )
