@@ -47,7 +47,12 @@ class SubRiemannianLora(ContrastiveLora):
             raise ValueError(f"SR_MASK_PLACEMENT must be backward or forward, got {self.mask_placement}")
         self._current_contrast_grads: dict[int, Any] = {}
         self._previous_boundary: dict[int, dict[str, Any]] = {}
-        self._lookahead_batches: list[tuple[Any, tuple[Any, ...]]] = []
+        # Each entry is (loss_fn, exact samples used by that micro-batch, 1/grad_accum_steps).
+        # Keeping the original micro-batch partition makes the virtual objective match the
+        # objective that produced the accumulated contrastive gradient.
+        self._lookahead_batches: list[tuple[Any, tuple[Any, ...], float]] = []
+        self._previous_trainable_state: dict[str, Any] | None = None
+        self.same_sample_secant = self.bool_value(self.env.get("SR_SAME_SAMPLE_SECANT", "true"))
         self._last_step_rows: list[dict[str, Any]] = []
         self.visualization_enabled = self.bool_value(self.env.get("SR_VISUALIZE_MASK", "true"))
         self.visualization_interval = max(1, int(self.env.get("SR_VISUALIZE_EVERY", self.env.get("EVAL_EVERY_STEPS", "50"))))
@@ -81,7 +86,7 @@ class SubRiemannianLora(ContrastiveLora):
             (out.loss / grad_accum_steps).backward()
             return
 
-        self.remember_lookahead_batch(out)
+        self.remember_lookahead_batch(out, grad_accum_steps)
 
         trainable = [param for param in model.parameters() if param.requires_grad]
         saved_grads = [(param, None if param.grad is None else param.grad.detach().clone()) for param in trainable]
@@ -117,19 +122,202 @@ class SubRiemannianLora(ContrastiveLora):
                 detached = combined.detach().float()
                 self._current_contrast_grads[module_id] = detached.clone() if current is None else current + detached
 
-    def before_optimizer_step(self, model: Any, step: int) -> dict[str, Any] | None:
+    def before_optimizer_step(self, model: Any, step: int, optimizer: Any | None = None) -> dict[str, Any] | None:
+        import torch
+
         targets = self.target_lora_b_modules(model)
+        probe_batches = self.lookahead_probe_batches()
         if not targets:
             self._current_contrast_grads.clear()
             self._lookahead_batches.clear()
             return {"active": False, "reason": "no_sr_target_lora_b"}
 
-        rows = []
-        for name, module in targets:
-            row = self.precondition_module_gradient(model, step, name, module)
-            if row is not None:
-                rows.append(row)
+        # The first optimizer boundary is kept as the reference model state.  From the
+        # next boundary onward we estimate the secant on the *current accumulated
+        # samples* at both W_t and W_{t-1}, instead of subtracting gradients from two
+        # unrelated training batches.
+        if self._previous_trainable_state is None:
+            rows = []
+            for name, module in targets:
+                current_grad = self._current_contrast_grads.get(id(module))
+                current_weight = module.weight.detach().float().clone()
+                if current_grad is not None:
+                    self._previous_boundary[id(module)] = {
+                        "weight": current_weight,
+                        "contrast_grad": current_grad.detach().float().clone(),
+                    }
+                rows.append({"active": False, "name": name, "reason": "first_boundary_skip"})
+            self._previous_trainable_state = self.snapshot_trainable_state(model)
+            self._current_contrast_grads.clear()
+            self._lookahead_batches.clear()
+            self._last_step_rows = rows
+            if self.debug is not None:
+                self.debug.record_step(step=step, rows=rows)
+            return {"active": False, "reason": "first_boundary_skip", "modules": len(rows)}
 
+        same_current: dict[str, Any] = {}
+        same_previous: dict[str, Any] = {}
+        if self.same_sample_secant and probe_batches:
+            same_current, same_previous = self.same_sample_secant_gradients(
+                model=model,
+                targets=targets,
+                probe_batches=probe_batches,
+            )
+
+        contexts: list[dict[str, Any]] = []
+        rows: list[dict[str, Any]] = []
+        for name, module in targets:
+            module_id = id(module)
+            param_name = f"{name}.weight"
+            current_grad = self._current_contrast_grads.get(module_id)
+            if current_grad is None:
+                rows.append({"active": False, "name": name, "reason": "no_current_grad"})
+                continue
+
+            weight = module.weight
+            current_weight = weight.detach().float().clone()
+            previous_weight = self._previous_trainable_state.get(param_name)
+            if previous_weight is None:
+                previous = self._previous_boundary.get(module_id)
+                previous_weight = None if previous is None else previous.get("weight")
+            if previous_weight is None:
+                rows.append({"active": False, "name": name, "reason": "no_previous_weight"})
+                continue
+            previous_weight = previous_weight.to(device=current_weight.device, dtype=current_weight.dtype)
+            delta_weight = current_weight - previous_weight
+
+            if param_name in same_current and param_name in same_previous:
+                current_secant_grad = same_current[param_name].to(device=current_weight.device, dtype=torch.float32)
+                previous_secant_grad = same_previous[param_name].to(device=current_weight.device, dtype=torch.float32)
+                delta_contrast = current_secant_grad - previous_secant_grad
+                secant_source = "same_samples_current_vs_previous_state"
+            else:
+                previous = self._previous_boundary.get(module_id)
+                if previous is None or previous.get("contrast_grad") is None:
+                    rows.append({"active": False, "name": name, "reason": "no_previous_grad"})
+                    continue
+                delta_contrast = current_grad.detach().float() - previous["contrast_grad"].to(device=current_grad.device)
+                secant_source = "fallback_cross_batch"
+
+            x_raw, valid = self.secant_ratio(delta_contrast, delta_weight)
+            x_clipped = self.signed_soft_clip(x_raw, self.x_clip)
+            x_unit = self.l2_normalize_signed(x_clipped).detach()
+            metric_diag = self.metric_for_update(module.sr_metric_raw, x_unit)
+            inv_metric = metric_diag.reciprocal()
+
+            # The real training update is modified only here.  The lookahead below uses
+            # virtual parameter copies and therefore cannot mutate the live model.
+            if self.mask_placement == "forward":
+                self.update_forward_mask(module, inv_metric)
+            elif self.mask_placement == "backward" and weight.grad is not None:
+                preconditioned = (weight.grad.detach().float() * inv_metric).to(dtype=weight.grad.dtype)
+                weight.grad.copy_(preconditioned)
+
+            reg_loss, loss_parts = self.metric_regularization_loss(module, x_unit)
+            reg_grad = torch.autograd.grad(reg_loss, module.sr_metric_raw, allow_unused=True)[0]
+            module.sr_metric_raw.grad = None if reg_grad is None else reg_grad.detach().clone()
+
+            contexts.append(
+                {
+                    "name": name,
+                    "param_name": param_name,
+                    "module": module,
+                    "weight": weight,
+                    "current_grad": current_grad,
+                    "delta_weight": delta_weight,
+                    "delta_contrast": delta_contrast,
+                    "x_unit": x_unit,
+                    "valid": valid,
+                    "metric_diag": metric_diag,
+                    "inv_metric": inv_metric,
+                    "reg_loss": reg_loss,
+                    "loss_parts": loss_parts,
+                    "secant_source": secant_source,
+                }
+            )
+
+        # Compare the two methods from the same W_t, with the same accumulated
+        # contrastive gradient and the same exact (x, y+, y-) samples.  All SR target
+        # LoRA-B parameters are changed together in the virtual branch.
+        lookahead_loss, lookahead_row = self.joint_lookahead_improvement_loss(
+            model=model,
+            contexts=contexts,
+            probe_batches=probe_batches,
+            step=step,
+        )
+        if contexts and lookahead_row.get("active"):
+            metric_params = [ctx["module"].sr_metric_raw for ctx in contexts]
+            lookahead_grads = torch.autograd.grad(
+                self.lambda_lookahead * lookahead_loss,
+                metric_params,
+                allow_unused=True,
+            )
+            for ctx, lookahead_grad in zip(contexts, lookahead_grads):
+                if lookahead_grad is None:
+                    continue
+                existing = ctx["module"].sr_metric_raw.grad
+                ctx["module"].sr_metric_raw.grad = (
+                    lookahead_grad.detach().clone()
+                    if existing is None
+                    else existing + lookahead_grad.detach()
+                )
+
+        for ctx in contexts:
+            current_grad = ctx["current_grad"]
+            inv_metric = ctx["inv_metric"]
+            metric_diag = ctx["metric_diag"]
+            x_unit = ctx["x_unit"]
+            valid = ctx["valid"]
+            raw_grad_norm = self.norm(current_grad)
+            preconditioned_norm = self.norm(current_grad * inv_metric)
+            self.record_soft_mask_visualization(
+                step=step,
+                name=ctx["name"],
+                mask=inv_metric,
+                metric=metric_diag,
+                x_unit=x_unit,
+            )
+            total_metric_loss = self.scalar(ctx["reg_loss"])
+            if lookahead_row.get("active"):
+                total_metric_loss += self.lambda_lookahead * self.scalar(lookahead_loss.detach())
+            loss_parts = dict(ctx["loss_parts"])
+            loss_parts["lookahead"] = self.scalar(lookahead_loss.detach()) if lookahead_row.get("active") else 0.0
+            row = {
+                "active": True,
+                "name": ctx["name"],
+                "mask_placement": self.mask_placement,
+                "secant_source": ctx["secant_source"],
+                "shape": list(ctx["weight"].shape),
+                "soft_mask": self.tensor_distribution(inv_metric),
+                "d_weight_norm": self.norm(ctx["delta_weight"]),
+                "d_contrast_grad_norm": self.norm(ctx["delta_contrast"]),
+                "x_norm": self.norm(x_unit),
+                "x_min": self.scalar(x_unit.min()),
+                "x_max": self.scalar(x_unit.max()),
+                "x_mean": self.scalar(x_unit.mean()),
+                "x_negative_fraction": self.scalar((x_unit < 0).float().mean()),
+                "x_positive_fraction": self.scalar((x_unit > 0).float().mean()),
+                "small_denom_fraction": 1.0 - self.scalar(valid.float().mean()),
+                "metric_min": self.scalar(metric_diag.min()),
+                "metric_max": self.scalar(metric_diag.max()),
+                "metric_mean": self.scalar(metric_diag.mean()),
+                "inv_metric_mean": self.scalar(inv_metric.mean()),
+                "raw_grad_norm": raw_grad_norm,
+                "preconditioned_grad_norm": preconditioned_norm,
+                "suppression_ratio": self.safe_ratio(preconditioned_norm, raw_grad_norm),
+                "metric_loss": total_metric_loss,
+                "metric_loss_parts": loss_parts,
+                "lookahead": lookahead_row,
+            }
+            rows.append(row)
+            self._previous_boundary[id(ctx["module"])] = {
+                "weight": ctx["weight"].detach().float().clone(),
+                "contrast_grad": current_grad.detach().float().clone(),
+            }
+
+        # Snapshot W_t before optimizer.step(); on the next boundary it is the exact
+        # previous trainable state used for same-sample secant estimation.
+        self._previous_trainable_state = self.snapshot_trainable_state(model)
         self._current_contrast_grads.clear()
         self._lookahead_batches.clear()
         self._last_step_rows = rows
@@ -152,7 +340,7 @@ class SubRiemannianLora(ContrastiveLora):
                 row.get("lookahead", {}).get("objective_gain", 0.0) for row in active_rows
             ),
             "lookahead_better_fraction": self.mean(
-                1.0 if row.get("lookahead", {}).get("masked_better_than_plain") else 0.0
+                1.0 if row.get("lookahead", {}).get("sr_better_than_contrastive") else 0.0
                 for row in active_rows
             ),
             "metric_min": min(row["metric_min"] for row in active_rows),
@@ -160,93 +348,97 @@ class SubRiemannianLora(ContrastiveLora):
             "sample_modules": active_rows[:3],
         }
 
-    def precondition_module_gradient(self, model: Any, step: int, name: str, module: Any) -> dict[str, Any] | None:
+    def snapshot_trainable_state(self, model: Any) -> dict[str, Any]:
+        return {
+            name: param.detach().clone()
+            for name, param in model.named_parameters()
+            if param.requires_grad and not name.endswith("sr_metric_raw")
+        }
+
+    def same_sample_secant_gradients(
+        self,
+        model: Any,
+        targets: Sequence[tuple[str, Any]],
+        probe_batches: Sequence[tuple[Any, tuple[Any, ...], float]],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         import torch
 
-        module_id = id(module)
-        current_grad = self._current_contrast_grads.get(module_id)
-        if current_grad is None:
-            return {"active": False, "name": name, "reason": "no_current_grad"}
+        if self._previous_trainable_state is None or not probe_batches:
+            return {}, {}
 
-        weight = module.weight
-        current_weight = weight.detach().float().clone()
-        previous = self._previous_boundary.get(module_id)
-        if previous is None:
-            self._previous_boundary[module_id] = {
-                "weight": current_weight,
-                "contrast_grad": current_grad.detach().float().clone(),
-            }
-            return {"active": False, "name": name, "reason": "first_boundary_skip"}
+        parameter_lookup = dict(model.named_parameters())
+        target_param_names = [f"{name}.weight" for name, _ in targets]
 
-        delta_weight = current_weight - previous["weight"].to(device=current_weight.device)
-        delta_contrast = current_grad.detach().float() - previous["contrast_grad"].to(device=current_grad.device)
-        x_raw, valid = self.secant_ratio(delta_contrast, delta_weight)
-        x_clipped = self.signed_soft_clip(x_raw, self.x_clip)
-        x_unit = self.l2_normalize_signed(x_clipped).detach()
-        metric_diag = self.metric_for_update(module.sr_metric_raw, x_unit)
-        inv_metric = metric_diag.reciprocal()
+        current_overrides: dict[str, Any] = {}
+        current_vars = []
+        for param_name in target_param_names:
+            param = parameter_lookup.get(param_name)
+            if param is None:
+                continue
+            value = param.detach().clone().requires_grad_(True)
+            current_overrides[param_name] = value
+            current_vars.append((param_name, value))
 
-        if self.mask_placement == "forward":
-            self.update_forward_mask(module, inv_metric)
-        elif self.mask_placement == "backward" and weight.grad is not None:
-            preconditioned = (weight.grad.detach().float() * inv_metric).to(dtype=weight.grad.dtype)
-            weight.grad.copy_(preconditioned)
+        previous_overrides: dict[str, Any] = {}
+        previous_vars = []
+        for name, value in self._previous_trainable_state.items():
+            param = parameter_lookup.get(name)
+            if param is None:
+                continue
+            restored = value.to(device=param.device, dtype=param.dtype).detach().clone()
+            if name in target_param_names:
+                restored.requires_grad_(True)
+                previous_vars.append((name, restored))
+            previous_overrides[name] = restored
 
-        param_name = f"{name}.weight"
-        metric_loss, loss_parts, lookahead_row = self.metric_parameter_loss(
-            model=model,
-            param_name=param_name,
-            module=module,
-            x_unit=x_unit,
-            contrast_grad=current_grad,
-            step=step,
-        )
-        metric_grad = torch.autograd.grad(metric_loss, module.sr_metric_raw, allow_unused=True)[0]
-        if metric_grad is not None:
-            module.sr_metric_raw.grad = metric_grad.detach()
+        if not current_vars or not previous_vars:
+            return {}, {}
 
-        raw_grad_norm = self.norm(current_grad)
-        preconditioned_norm = self.norm(current_grad * inv_metric)
-        mask_stats = self.tensor_distribution(inv_metric)
-        self.record_soft_mask_visualization(
-            step=step,
-            name=name,
-            mask=inv_metric,
-            metric=metric_diag,
-            x_unit=x_unit,
-        )
+        was_training = bool(getattr(model, "training", False))
+        rng_state = self.capture_rng_state()
+        try:
+            model.eval()
+            # Both branches see exactly the same samples, negatives, model mode and RNG.
+            self.restore_rng_state(rng_state)
+            current_objective, _ = self.lookahead_objective_batches(
+                model=model,
+                probe_batches=probe_batches,
+                parameter_overrides=current_overrides,
+                normalize=False,
+            )
+            current_grad_values = torch.autograd.grad(
+                current_objective,
+                [value for _, value in current_vars],
+                allow_unused=True,
+            )
 
-        row = {
-            "active": True,
-            "name": name,
-            "mask_placement": self.mask_placement,
-            "shape": list(weight.shape),
-            "soft_mask": mask_stats,
-            "d_weight_norm": self.norm(delta_weight),
-            "d_contrast_grad_norm": self.norm(delta_contrast),
-            "x_norm": self.norm(x_unit),
-            "x_min": self.scalar(x_unit.min()),
-            "x_max": self.scalar(x_unit.max()),
-            "x_mean": self.scalar(x_unit.mean()),
-            "x_negative_fraction": self.scalar((x_unit < 0).float().mean()),
-            "x_positive_fraction": self.scalar((x_unit > 0).float().mean()),
-            "small_denom_fraction": 1.0 - self.scalar(valid.float().mean()),
-            "metric_min": self.scalar(metric_diag.min()),
-            "metric_max": self.scalar(metric_diag.max()),
-            "metric_mean": self.scalar(metric_diag.mean()),
-            "inv_metric_mean": self.scalar(inv_metric.mean()),
-            "raw_grad_norm": raw_grad_norm,
-            "preconditioned_grad_norm": preconditioned_norm,
-            "suppression_ratio": self.safe_ratio(preconditioned_norm, raw_grad_norm),
-            "metric_loss": self.scalar(metric_loss),
-            "metric_loss_parts": loss_parts,
-            "lookahead": lookahead_row,
+            self.restore_rng_state(rng_state)
+            previous_objective, _ = self.lookahead_objective_batches(
+                model=model,
+                probe_batches=probe_batches,
+                parameter_overrides=previous_overrides,
+                normalize=False,
+            )
+            previous_grad_values = torch.autograd.grad(
+                previous_objective,
+                [value for _, value in previous_vars],
+                allow_unused=True,
+            )
+        finally:
+            self.restore_rng_state(rng_state)
+            model.train(was_training)
+
+        current = {
+            name: grad.detach().float()
+            for (name, _), grad in zip(current_vars, current_grad_values)
+            if grad is not None
         }
-        self._previous_boundary[module_id] = {
-            "weight": current_weight,
-            "contrast_grad": current_grad.detach().float().clone(),
+        previous = {
+            name: grad.detach().float()
+            for (name, _), grad in zip(previous_vars, previous_grad_values)
+            if grad is not None
         }
-        return row
+        return current, previous
 
     def attach_sr_metric_parameters(self, model: Any) -> None:
         import torch
@@ -445,16 +637,7 @@ class SubRiemannianLora(ContrastiveLora):
 
         return torch.tanh(metric_raw.float() / max(self.metric_temp, 1e-12))
 
-    def metric_parameter_loss(
-        self,
-        model: Any,
-        param_name: str,
-        module: Any,
-        x_unit: Any,
-        contrast_grad: Any,
-        step: int,
-    ) -> tuple[Any, dict[str, float], dict[str, Any]]:
-        import torch
+    def metric_regularization_loss(self, module: Any, x_unit: Any) -> tuple[Any, dict[str, float]]:
         import torch.nn.functional as F
 
         metric_raw = module.sr_metric_raw
@@ -467,19 +650,11 @@ class SubRiemannianLora(ContrastiveLora):
         bound_loss = bound_loss + F.relu(unbounded_metric - self.metric_max).pow(2).mean()
         condition = unbounded_metric.max() / unbounded_metric.min().clamp_min(1e-12)
         condition_loss = F.relu(condition - self.condition_max).pow(2)
-        lookahead_loss, lookahead_row = self.lookahead_improvement_loss(
-            model=model,
-            param_name=param_name,
-            module=module,
-            contrast_grad=contrast_grad,
-            step=step,
-        )
         loss = (
             self.lambda_fit * fit_loss
             + self.lambda_identity * identity_loss
             + self.lambda_bound * bound_loss
             + self.lambda_condition * condition_loss
-            + self.lambda_lookahead * lookahead_loss
         )
         return loss, {
             "fit": self.scalar(fit_loss),
@@ -487,107 +662,246 @@ class SubRiemannianLora(ContrastiveLora):
             "bound": self.scalar(bound_loss),
             "condition": self.scalar(condition_loss),
             "condition_value": self.scalar(condition),
-            "lookahead": self.scalar(lookahead_loss),
-        }, lookahead_row
+        }
 
-    def remember_lookahead_batch(self, out: Any) -> None:
-        if not self.lookahead_enabled:
-            return
+    def remember_lookahead_batch(self, out: Any, grad_accum_steps: int) -> None:
         loss_fn = getattr(out, "loss_fn", None)
         samples = getattr(out, "samples", None)
         if loss_fn is None or samples is None:
             return
-        self._lookahead_batches.append((loss_fn, tuple(samples)))
+        # Keep the exact judged hallucination samples and their fixed negatives.
+        self._lookahead_batches.append((loss_fn, tuple(samples), 1.0 / max(1, int(grad_accum_steps))))
 
-    def lookahead_improvement_loss(
+    def lookahead_probe_batches(self) -> tuple[tuple[Any, tuple[Any, ...], float], ...]:
+        # Do not silently take only the last micro-batch.  The accumulated gradient was
+        # produced by every stored micro-batch, so both virtual branches are evaluated
+        # on the same complete set.
+        return tuple(self._lookahead_batches)
+
+    def joint_lookahead_improvement_loss(
         self,
         model: Any,
-        param_name: str,
-        module: Any,
-        contrast_grad: Any,
+        contexts: Sequence[Mapping[str, Any]],
+        probe_batches: Sequence[tuple[Any, tuple[Any, ...], float]],
         step: int,
     ) -> tuple[Any, dict[str, Any]]:
         import torch
         import torch.nn.functional as F
 
-        zero = module.sr_metric_raw.new_tensor(0.0)
+        metric_params = [ctx["module"].sr_metric_raw for ctx in contexts]
+        zero = metric_params[0].new_tensor(0.0) if metric_params else torch.tensor(0.0)
         if not self.lookahead_enabled:
             return zero, {"active": False, "reason": "disabled"}
         if step % self.lookahead_every != 0:
             return zero, {"active": False, "reason": "interval"}
-        probe = self.lookahead_probe_batch()
-        if probe is None:
-            return zero, {"active": False, "reason": "no_probe_batch"}
+        if not probe_batches:
+            return zero, {"active": False, "reason": "no_probe_batches"}
 
-        loss_fn, samples = probe
-        weight = module.weight
-        update = contrast_grad.detach().to(device=weight.device, dtype=torch.float32)
-        metric_diag = self.metric_from_raw(module.sr_metric_raw)
-        masked_update = update * metric_diag.reciprocal()
-        plain_param = weight - self.lookahead_lr * update.to(device=weight.device, dtype=weight.dtype)
-        masked_param = weight - self.lookahead_lr * masked_update.to(device=weight.device, dtype=weight.dtype)
+        contrastive_overrides: dict[str, Any] = {}
+        sr_overrides: dict[str, Any] = {}
+        used_targets = 0
+        for ctx in contexts:
+            name = str(ctx["name"])
+            module = ctx["module"]
+            contrast_grad = ctx["current_grad"]
+            param_name = str(ctx["param_name"])
+            weight = module.weight
+            update = contrast_grad.detach().to(device=weight.device, dtype=torch.float32)
 
-        if self.lookahead_sync_dropout_rng:
-            outer_rng_state = self.capture_rng_state()
-            try:
-                # Compare plain vs. masked candidates under the exact same
-                # CPU/CUDA dropout RNG stream.
-                self.restore_rng_state(outer_rng_state)
-                with torch.no_grad():
-                    plain_objective, plain_parts = self.lookahead_objective(
-                        model=model,
-                        loss_fn=loss_fn,
-                        samples=samples,
-                        param_name=param_name,
-                        updated_param=plain_param,
-                    )
+            # Forward value == the exact mask that is applied to the real gradient.
+            # Backward derivative == the learned metric path, so lookahead can still
+            # train sr_metric_raw.  This avoids evaluating an identity mask when the
+            # live update is currently using the x-derived fallback mask.
+            actual_inv_metric = ctx["inv_metric"].detach().to(device=weight.device, dtype=torch.float32)
+            learned_inv_metric = self.metric_from_raw(module.sr_metric_raw).reciprocal()
+            candidate_inv_metric = actual_inv_metric + (learned_inv_metric - learned_inv_metric.detach())
+            masked_update = update * candidate_inv_metric
 
-                self.restore_rng_state(outer_rng_state)
-                masked_objective, masked_parts = self.lookahead_objective(
-                    model=model,
-                    loss_fn=loss_fn,
-                    samples=samples,
-                    param_name=param_name,
-                    updated_param=masked_param,
-                )
-            finally:
-                # SR-only probe forwards must not advance the RNG stream used
-                # by subsequent real training forwards.
-                self.restore_rng_state(outer_rng_state)
-        else:
+            contrastive_overrides[param_name] = (
+                weight - self.lookahead_lr * update.to(device=weight.device, dtype=weight.dtype)
+            ).detach()
+            sr_overrides[param_name] = weight - self.lookahead_lr * masked_update.to(
+                device=weight.device,
+                dtype=weight.dtype,
+            )
+
+            # For the forward-mask ablation, compare an unmasked contrastive branch to
+            # the exact candidate SR mask, again from the same W_t.
+            if self.mask_placement == "forward":
+                buffer_name = f"{name}.sr_forward_mask"
+                contrastive_overrides[buffer_name] = torch.ones_like(actual_inv_metric, dtype=torch.float32)
+                sr_overrides[buffer_name] = candidate_inv_metric
+            used_targets += 1
+
+        if used_targets == 0:
+            return zero, {"active": False, "reason": "no_target_grad"}
+
+        probe_samples = sum(len(samples) for _, samples, _ in probe_batches)
+        was_training = bool(getattr(model, "training", False))
+        rng_state = self.capture_rng_state()
+        try:
+            # Lookahead is a deterministic diagnostic/metric-learning comparison.
+            # train-time dropout must not make the two virtual branches differ.
+            model.eval()
+            self.restore_rng_state(rng_state)
             with torch.no_grad():
-                plain_objective, plain_parts = self.lookahead_objective(
+                contrastive_objective, contrastive_parts = self.lookahead_objective_batches(
                     model=model,
-                    loss_fn=loss_fn,
-                    samples=samples,
-                    param_name=param_name,
-                    updated_param=plain_param,
+                    probe_batches=probe_batches,
+                    parameter_overrides=contrastive_overrides,
+                    normalize=True,
                 )
-            masked_objective, masked_parts = self.lookahead_objective(
+
+            self.restore_rng_state(rng_state)
+            sr_objective, sr_parts = self.lookahead_objective_batches(
+                model=model,
+                probe_batches=probe_batches,
+                parameter_overrides=sr_overrides,
+                normalize=True,
+            )
+        finally:
+            self.restore_rng_state(rng_state)
+            model.train(was_training)
+
+        objective_delta = sr_objective - contrastive_objective.detach()
+        loss = F.softplus(objective_delta + self.lookahead_margin)
+        gain = contrastive_objective.detach() - sr_objective.detach()
+        better = bool(self.scalar(gain) > 0.0)
+        row = {
+            "active": True,
+            "comparison": "contrastive_vs_sr_same_samples_same_start_joint_targets",
+            "probe_samples": probe_samples,
+            "probe_microbatches": len(probe_batches),
+            "targets": used_targets,
+            "contrastive_gold_ce": self.float_or_none(contrastive_parts["gold_ce"]),
+            "sr_gold_ce": self.float_or_none(sr_parts["gold_ce"]),
+            "contrastive_hall_ce": self.float_or_none(contrastive_parts["hall_ce"]),
+            "sr_hall_ce": self.float_or_none(sr_parts["hall_ce"]),
+            "contrastive_objective": self.scalar(contrastive_objective),
+            "sr_objective": self.scalar(sr_objective.detach()),
+            "objective_gain": self.scalar(gain),
+            "sr_better_than_contrastive": better,
+            "loss": self.scalar(loss.detach()),
+            "margin": self.lookahead_margin,
+            # Backward-compatible aliases for existing debug scripts.
+            "plain_gold_ce": self.float_or_none(contrastive_parts["gold_ce"]),
+            "masked_gold_ce": self.float_or_none(sr_parts["gold_ce"]),
+            "plain_hall_ce": self.float_or_none(contrastive_parts["hall_ce"]),
+            "masked_hall_ce": self.float_or_none(sr_parts["hall_ce"]),
+            "plain_objective": self.scalar(contrastive_objective),
+            "masked_objective": self.scalar(sr_objective.detach()),
+            "masked_better_than_plain": better,
+        }
+        return loss, row
+
+    @staticmethod
+    def _weighted_mean_or_none(total: Any | None, total_weight: float) -> Any | None:
+        if total is None:
+            return None
+        return total / max(total_weight, 1e-12)
+
+    def lookahead_objective_batches(
+        self,
+        model: Any,
+        probe_batches: Sequence[tuple[Any, tuple[Any, ...], float]],
+        parameter_overrides: Mapping[str, Any],
+        normalize: bool,
+    ) -> tuple[Any, dict[str, Any]]:
+        objective_total = None
+        gold_total = None
+        hall_total = None
+        weight_total = 0.0
+
+        for loss_fn, samples, scale in probe_batches:
+            if not samples:
+                continue
+            gold_ce = self.lookahead_sequence_ce(
                 model=model,
                 loss_fn=loss_fn,
                 samples=samples,
-                param_name=param_name,
-                updated_param=masked_param,
+                answer_attr="answer",
+                parameter_overrides=parameter_overrides,
+                chunk_size=self.lookahead_chunk_size,
             )
-        objective_delta = masked_objective - plain_objective.detach()
-        loss = F.softplus(objective_delta + self.lookahead_margin)
-        gain = plain_objective.detach() - masked_objective.detach()
-        return loss, {
-            "active": True,
-            "probe_samples": len(samples),
-            "chunk_size": self.lookahead_chunk_size,
-            "plain_gold_ce": self.float_or_none(plain_parts["gold_ce"]),
-            "masked_gold_ce": self.float_or_none(masked_parts["gold_ce"]),
-            "plain_hall_ce": self.float_or_none(plain_parts["hall_ce"]),
-            "masked_hall_ce": self.float_or_none(masked_parts["hall_ce"]),
-            "plain_objective": self.scalar(plain_objective),
-            "masked_objective": self.scalar(masked_objective.detach()),
-            "objective_gain": self.scalar(gain),
-            "masked_better_than_plain": bool(self.scalar(gain) > 0.0),
-            "loss": self.scalar(loss.detach()),
-            "margin": self.lookahead_margin,
-        }
+            hall_samples = tuple(sample for sample in samples if getattr(sample, "hallucinated_answer", ""))
+            hall_ce = None
+            batch_objective = gold_ce
+            if hall_samples:
+                hall_ce = self.lookahead_sequence_ce(
+                    model=model,
+                    loss_fn=loss_fn,
+                    samples=hall_samples,
+                    answer_attr="hallucinated_answer",
+                    parameter_overrides=parameter_overrides,
+                    chunk_size=self.lookahead_chunk_size,
+                )
+                batch_objective = batch_objective - hall_ce
+
+            scaled_objective = batch_objective * scale
+            scaled_gold = gold_ce * scale
+            objective_total = scaled_objective if objective_total is None else objective_total + scaled_objective
+            gold_total = scaled_gold if gold_total is None else gold_total + scaled_gold
+            if hall_ce is not None:
+                scaled_hall = hall_ce * scale
+                hall_total = scaled_hall if hall_total is None else hall_total + scaled_hall
+            weight_total += scale
+
+        if objective_total is None or gold_total is None:
+            # This path is only reachable with empty probe batches.
+            first = next(iter(parameter_overrides.values()))
+            zero = first.new_tensor(0.0)
+            return zero, {"gold_ce": zero, "hall_ce": None}
+
+        if normalize:
+            objective_total = objective_total / max(weight_total, 1e-12)
+            gold_total = gold_total / max(weight_total, 1e-12)
+            if hall_total is not None:
+                hall_total = hall_total / max(weight_total, 1e-12)
+        return objective_total, {"gold_ce": gold_total, "hall_ce": hall_total}
+
+    @staticmethod
+    def lookahead_sequence_ce(
+        model: Any,
+        loss_fn: Any,
+        samples: Sequence[Any],
+        answer_attr: str,
+        parameter_overrides: Mapping[str, Any],
+        chunk_size: int = 2,
+    ) -> Any:
+        import torch
+        import torch.nn.functional as F
+        from torch.func import functional_call
+
+        reference = next(iter(parameter_overrides.values()))
+        total_loss = reference.new_tensor(0.0, dtype=torch.float32)
+        total_tokens = reference.new_tensor(0.0, dtype=torch.float32)
+        chunk_size = max(1, int(chunk_size))
+        for start in range(0, len(samples), chunk_size):
+            chunk = samples[start : start + chunk_size]
+            if not chunk:
+                continue
+            batch = loss_fn.build_lm_batch(chunk, answer_attr)
+            batch = {key: value.to(reference.device) for key, value in batch.items()}
+            logits = functional_call(
+                model,
+                dict(parameter_overrides),
+                (),
+                {"input_ids": batch["input_ids"], "attention_mask": batch["attention_mask"]},
+                strict=False,
+            ).logits
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = batch["labels"][:, 1:].contiguous()
+            total_loss = total_loss + F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+                reduction="sum",
+            ).float()
+            total_tokens = total_tokens + shift_labels.ne(-100).sum().to(
+                device=total_tokens.device,
+                dtype=total_tokens.dtype,
+            )
+        return total_loss / total_tokens.clamp_min(1.0)
 
     @staticmethod
     def capture_rng_state() -> dict[str, Any]:
@@ -609,85 +923,6 @@ class SubRiemannianLora(ContrastiveLora):
         cuda_states = state.get("cuda")
         if cuda_states is not None and torch.cuda.is_available():
             torch.cuda.set_rng_state_all(cuda_states)
-
-    def lookahead_probe_batch(self) -> tuple[Any, tuple[Any, ...]] | None:
-        if not self._lookahead_batches:
-            return None
-        loss_fn, samples = self._lookahead_batches[-1]
-        selected = tuple(samples[: self.lookahead_max_samples])
-        return None if not selected else (loss_fn, selected)
-
-    def lookahead_objective(
-        self,
-        model: Any,
-        loss_fn: Any,
-        samples: Sequence[Any],
-        param_name: str,
-        updated_param: Any,
-    ) -> tuple[Any, dict[str, Any]]:
-        gold_ce = self.lookahead_sequence_ce(
-            model=model,
-            loss_fn=loss_fn,
-            samples=samples,
-            answer_attr="answer",
-            param_name=param_name,
-            updated_param=updated_param,
-            chunk_size=self.lookahead_chunk_size,
-        )
-        hall_samples = tuple(sample for sample in samples if getattr(sample, "hallucinated_answer", ""))
-        hall_ce = None
-        objective = gold_ce
-        if hall_samples:
-            hall_ce = self.lookahead_sequence_ce(
-                model=model,
-                loss_fn=loss_fn,
-                samples=hall_samples,
-                answer_attr="hallucinated_answer",
-                param_name=param_name,
-                updated_param=updated_param,
-                chunk_size=self.lookahead_chunk_size,
-            )
-            objective = objective - hall_ce
-        return objective, {"gold_ce": gold_ce, "hall_ce": hall_ce}
-
-    @staticmethod
-    def lookahead_sequence_ce(
-        model: Any,
-        loss_fn: Any,
-        samples: Sequence[Any],
-        answer_attr: str,
-        param_name: str,
-        updated_param: Any,
-        chunk_size: int = 2,
-    ) -> Any:
-        import torch.nn.functional as F
-        from torch.func import functional_call
-
-        total_loss = updated_param.new_tensor(0.0, dtype=updated_param.float().dtype)
-        total_tokens = updated_param.new_tensor(0.0, dtype=updated_param.float().dtype)
-        chunk_size = max(1, int(chunk_size))
-        for start in range(0, len(samples), chunk_size):
-            chunk = samples[start : start + chunk_size]
-            if not chunk:
-                continue
-            batch = loss_fn.build_lm_batch(chunk, answer_attr)
-            batch = {key: value.to(updated_param.device) for key, value in batch.items()}
-            logits = functional_call(
-                model,
-                {param_name: updated_param},
-                (),
-                {"input_ids": batch["input_ids"], "attention_mask": batch["attention_mask"]},
-            ).logits
-            shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = batch["labels"][:, 1:].contiguous()
-            total_loss = total_loss + F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                ignore_index=-100,
-                reduction="sum",
-            )
-            total_tokens = total_tokens + shift_labels.ne(-100).sum().to(device=total_tokens.device, dtype=total_tokens.dtype)
-        return total_loss / total_tokens.clamp_min(1.0)
 
     def prepare_visualization_dir(self) -> None:
         if not self.visualization_enabled:
@@ -726,6 +961,7 @@ class SubRiemannianLora(ContrastiveLora):
                     "SR_METRIC_MAX": self.env.get("SR_METRIC_MAX"),
                     "SR_METRIC_GAIN": self.env.get("SR_METRIC_GAIN"),
                     "SR_LOOKAHEAD_SYNC_DROPOUT_RNG": self.env.get("SR_LOOKAHEAD_SYNC_DROPOUT_RNG", "true"),
+                    "SR_SAME_SAMPLE_SECANT": self.env.get("SR_SAME_SAMPLE_SECANT", "true"),
                     "SR_MASK_PLACEMENT": self.env.get("SR_MASK_PLACEMENT"),
                 },
             },
@@ -956,6 +1192,7 @@ class SrElementMetricDebugRecorder:
                         "SR_LOOKAHEAD_EVERY": self.env.get("SR_LOOKAHEAD_EVERY"),
                         "SR_LOOKAHEAD_MAX_SAMPLES": self.env.get("SR_LOOKAHEAD_MAX_SAMPLES"),
                         "SR_LOOKAHEAD_SYNC_DROPOUT_RNG": self.env.get("SR_LOOKAHEAD_SYNC_DROPOUT_RNG", "true"),
+                    "SR_SAME_SAMPLE_SECANT": self.env.get("SR_SAME_SAMPLE_SECANT", "true"),
                     },
                 },
             )
