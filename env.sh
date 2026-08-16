@@ -35,7 +35,7 @@ export LORA_TARGET_MODULES=q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_pr
 # SR-LoRA closed-form metric settings
 export SR_INCLUDE_MLP=true
 export SR_INCLUDE_ATTN=false
-export SR_TARGET_MODULES=gate_proj,up_proj,down_proj
+export SR_TARGET_MODULES=q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
 
 # Explicit SR layer indices. When this is set, these exact indices are authoritative.
 # Example: 25,26,27 => SR must be attached to all three layers.
@@ -106,3 +106,57 @@ export SR_DEBUG_DIR=outputs/visualization/sr_element_metric
 
 # Eval datasets for ablation runner. The runner overwrites EVAL_DATASET per run.
 export ABLATION_EVAL_DATASETS="drop hotpotqa_fullwiki halueval_dialogue halueval_summarization"
+
+# ---- Auto-added by ablation.sh ----
+export MODEL_NAME=Qwen/Qwen2.5-7B-Instruct
+export FROZEN_BASE_MODEL=Qwen/Qwen2.5-7B-Instruct
+export MODEL_TRUST_REMOTE_CODE=false
+export REQUIRE_CHAT_TEMPLATE=false
+
+# Keep training/hallucination judges fixed to Qwen; ablate only the eval judge.
+export JUDGE_MODEL=Qwen/Qwen2.5-7B-Instruct
+export HALLUCINATION_JUDGE_MODEL=Qwen/Qwen2.5-7B-Instruct
+export EVAL_JUDGE_MODEL=Qwen/Qwen2.5-7B-Instruct
+
+export EXPERIMENTS=contrastive_lora
+export METHOD=contrastive_lora
+export EVAL_DATASET=drop
+export OUTPUT_ROOT=outputs/ablation_seed/20260816_185013/model_Qwen_Qwen2p5_7B_Instruct/judge_Qwen_Qwen2p5_7B_Instruct/seed_44/layer_indices_25_26_27/maxstep_400/eval_drop/mask_backward/method_contrastive_lora
+export DEBUG=true
+
+export SR_DEBUG=true
+export SR_DEBUG_DIR=outputs/ablation_seed/20260816_185013/model_Qwen_Qwen2p5_7B_Instruct/judge_Qwen_Qwen2p5_7B_Instruct/seed_44/layer_indices_25_26_27/maxstep_400/eval_drop/mask_backward/method_contrastive_lora/debug/sr_element_metric
+export SR_VISUALIZE_MASK=true
+export SR_VISUALIZE_EVERY=50
+export SR_VISUALIZE_MAX_ELEMENTS=4096
+export SR_VISUALIZATION_DIR=outputs/visualization_ablation_seed/20260816_185013/model_Qwen_Qwen2p5_7B_Instruct/judge_Qwen_Qwen2p5_7B_Instruct/seed_44/layer_indices_25_26_27/maxstep_400/eval_drop/mask_backward/method_contrastive_lora/soft_mask
+
+export SR_MASK_PLACEMENT=backward
+export SR_MASK_MODE=backward
+
+export SR_RUN_NAME=ablation_seed__model_Qwen_Qwen2p5_7B_Instruct__judge_Qwen_Qwen2p5_7B_Instruct__seed_44__layer_indices_25_26_27__eval_drop__mask_backward__method_contrastive_lora
+export SR_RUN_GROUP=20260816_185013
+export SR_ABLATION_EXPERIMENT=ablation_seed
+export SR_ABLATION_METHOD=contrastive_lora
+export SR_ABLATION_EVAL_DATASET=drop
+export SR_ABLATION_MASK_PLACEMENT=backward
+export SR_ABLATION_LAYER_NAME=indices_25_26_27
+export SR_ABLATION_MODULE_NAME=mlp
+export SR_ABLATION_MAX_STEP=400
+export SR_ABLATION_OUTPUT_ROOT=outputs/ablation_seed/20260816_185013/model_Qwen_Qwen2p5_7B_Instruct/judge_Qwen_Qwen2p5_7B_Instruct/seed_44/layer_indices_25_26_27/maxstep_400/eval_drop/mask_backward/method_contrastive_lora
+export SR_ABLATION_VIS_DIR=outputs/visualization_ablation_seed/20260816_185013/model_Qwen_Qwen2p5_7B_Instruct/judge_Qwen_Qwen2p5_7B_Instruct/seed_44/layer_indices_25_26_27/maxstep_400/eval_drop/mask_backward/method_contrastive_lora/soft_mask
+
+export SR_TARGET_MODULES=gate_proj,up_proj,down_proj
+export SR_TARGET_LAYERS=3
+export SR_TARGET_LAYER_INDICES=25,26,27
+export SR_STRICT_TARGET_CHECK=true
+
+export CONTRASTIVE_SEED=44
+export TRAIN_SEED=44
+export SEED=44
+export PYTHONHASHSEED=44
+
+export TRAIN_MAX_STEPS=400
+export TRAIN_EARLY_STOP_STEPS=151
+export EVAL_EVERY_STEPS=50
+export EVAL_START_STEP=150
