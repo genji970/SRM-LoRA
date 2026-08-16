@@ -21,6 +21,9 @@ class SubRiemannianLora(ContrastiveLora):
         self.sr_target_modules = self.parse_csv(self.env.get("SR_TARGET_MODULES", "gate_proj,up_proj,down_proj"))
         self.target_layers = self.parse_target_layers(self.env.get("SR_TARGET_LAYERS", "1"))
         self.target_layer_indices = self.parse_layer_indices(self.env.get("SR_TARGET_LAYER_INDICES", "none"))
+        # When explicit layer indices are provided, they are the authoritative SR target set.
+        # SR_TARGET_LAYERS is only a fallback selector when SR_TARGET_LAYER_INDICES is none/all.
+        self.strict_target_check = self.bool_value(self.env.get("SR_STRICT_TARGET_CHECK", "true"))
         self.finite_diff_eps = float(self.env.get("SR_FINITE_DIFF_EPS", "1e-8"))
         self.x_clip = float(self.env.get("SR_X_CLIP", "10.0"))
         self.metric_gain = float(self.env.get("SR_METRIC_GAIN", "8.0"))
@@ -445,9 +448,12 @@ class SubRiemannianLora(ContrastiveLora):
 
         targets = self.target_lora_b_modules(model)
         if not targets:
+            # Still emit a persistent report before failing/returning so the resolved env is visible.
+            self.verify_sr_target_selection(model, targets, metrics_attached=0)
             print("[sr_lora] no elementwise lora_B targets found; SR preconditioner disabled", flush=True)
             return
 
+        attached = 0
         for name, module in targets:
             shape = tuple(module.weight.shape)
             current = getattr(module, "sr_metric_raw", None)
@@ -462,15 +468,130 @@ class SubRiemannianLora(ContrastiveLora):
             if self.mask_placement == "forward":
                 self.ensure_forward_mask_buffer(module, shape)
                 self.attach_forward_mask(module)
-            print(f"[sr_lora] attached elementwise metric to {name} shape={shape} mask_placement={self.mask_placement}", flush=True)
+            metric = getattr(module, "sr_metric_raw", None)
+            if metric is not None and tuple(metric.shape) == shape:
+                attached += 1
+            print(
+                f"[sr_lora] attached elementwise metric to {name} "
+                f"layer={self.layer_index(name)} shape={shape} mask_placement={self.mask_placement}",
+                flush=True,
+            )
 
+        report = self.verify_sr_target_selection(model, targets, metrics_attached=attached)
         print(
             "[sr_lora] active elementwise metrics="
             f"{len(targets)} modules={self.target_modules_label()} layers={self.target_layers_label()} "
-            f"layer_indices={self.target_layer_indices_label()} include_mlp={self.include_mlp} "
-            f"include_attn={self.include_attn} mask_placement={self.mask_placement}",
+            f"layer_indices={self.target_layer_indices_label()} actual_layers={report['actual_layer_indices']} "
+            f"include_mlp={self.include_mlp} include_attn={self.include_attn} "
+            f"mask_placement={self.mask_placement}",
             flush=True,
         )
+
+    def verify_sr_target_selection(
+        self,
+        model: Any,
+        targets: Sequence[tuple[str, Any]],
+        *,
+        metrics_attached: int,
+    ) -> dict[str, Any]:
+        """Verify that env-requested SR layers are the layers that actually received SR targets.
+
+        With explicit SR_TARGET_LAYER_INDICES, the check is strict by default: every requested
+        layer must be present and no extra layer may be selected.  A JSON report is also saved
+        under the experiment output directory for post-run inspection.
+        """
+        requested = None if self.target_layer_indices is None else set(self.target_layer_indices)
+        actual = {
+            index
+            for name, _ in targets
+            for index in [self.layer_index(name)]
+            if index is not None
+        }
+
+        modules_by_layer: dict[int, list[str]] = {}
+        for name, _ in targets:
+            index = self.layer_index(name)
+            if index is None:
+                continue
+            modules_by_layer.setdefault(index, []).append(name)
+
+        module_groups_by_layer = {
+            index: sorted({self.module_group_name(name) for name in names})
+            for index, names in modules_by_layer.items()
+        }
+        missing = sorted(requested - actual) if requested is not None else []
+        unexpected = sorted(actual - requested) if requested is not None else []
+
+        report = {
+            "strict": bool(self.strict_target_check),
+            "resolved_env": {
+                "SR_TARGET_LAYER_INDICES": self.env.get("SR_TARGET_LAYER_INDICES"),
+                "SR_TARGET_LAYERS": self.env.get("SR_TARGET_LAYERS"),
+                "SR_TARGET_MODULES": self.env.get("SR_TARGET_MODULES"),
+                "SR_INCLUDE_MLP": self.env.get("SR_INCLUDE_MLP"),
+                "SR_INCLUDE_ATTN": self.env.get("SR_INCLUDE_ATTN"),
+            },
+            "requested_layer_indices": None if requested is None else sorted(requested),
+            "actual_layer_indices": sorted(actual),
+            "requested_layer_count": None if requested is None else len(requested),
+            "actual_layer_count": len(actual),
+            "target_module_count": len(targets),
+            "metrics_attached": int(metrics_attached),
+            "missing_layer_indices": missing,
+            "unexpected_layer_indices": unexpected,
+            "modules_per_layer": {str(k): len(v) for k, v in sorted(modules_by_layer.items())},
+            "module_groups_per_layer": {str(k): v for k, v in sorted(module_groups_by_layer.items())},
+            "target_names": [name for name, _ in targets],
+        }
+
+        print(
+            "[sr_lora][target-check] "
+            f"requested_layers={report['requested_layer_indices']} "
+            f"actual_layers={report['actual_layer_indices']} "
+            f"requested_count={report['requested_layer_count']} "
+            f"actual_count={report['actual_layer_count']} "
+            f"target_modules={report['target_module_count']} "
+            f"metrics_attached={report['metrics_attached']}",
+            flush=True,
+        )
+        for index in sorted(modules_by_layer):
+            print(
+                "[sr_lora][target-check] "
+                f"layer={index} modules={len(modules_by_layer[index])} "
+                f"groups={module_groups_by_layer[index]}",
+                flush=True,
+            )
+
+        report_path = (
+            Path(self.env.get("OUTPUT_ROOT", "outputs"))
+            / self.name
+            / self.env.get("EVAL_DATASET", "eval")
+            / "sr_target_check.json"
+        )
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"[sr_lora][target-check] report={report_path}", flush=True)
+
+        errors = []
+        if requested is not None and (missing or unexpected):
+            errors.append(
+                f"requested={sorted(requested)} actual={sorted(actual)} "
+                f"missing={missing} unexpected={unexpected}"
+            )
+        if metrics_attached != len(targets):
+            errors.append(f"metrics_attached={metrics_attached} target_modules={len(targets)}")
+        if not targets:
+            errors.append("no SR LoRA-B target modules were found")
+
+        if errors:
+            message = "; ".join(errors)
+            if self.strict_target_check:
+                raise RuntimeError(f"SR target verification failed: {message}. See {report_path}")
+            print(f"[sr_lora][target-check] WARNING {message}", flush=True)
+        else:
+            print("[sr_lora][target-check] PASS", flush=True)
+
+        return report
 
 
     def ensure_forward_mask_buffer(self, module: Any, shape: tuple[int, ...]) -> None:
@@ -533,6 +654,11 @@ class SubRiemannianLora(ContrastiveLora):
             if "lora_B" in name and hasattr(module, "weight") and self.matches_target(name)
         ]
         candidates = self.filter_layer_indices(candidates)
+        # Explicit SR_TARGET_LAYER_INDICES is authoritative.  Do not silently trim the
+        # requested set again with SR_TARGET_LAYERS; otherwise e.g. 25,26,27 + layers=1
+        # would unexpectedly keep only one layer.
+        if self.target_layer_indices is not None:
+            return candidates
         if self.target_layers is None:
             return candidates
 
@@ -613,10 +739,9 @@ class SubRiemannianLora(ContrastiveLora):
     def metric_from_x(self, x_unit: Any) -> Any:
         import torch
 
-        risk = x_unit.abs()
-        metric = 1.0 + self.metric_gain * risk
+        metric = 1.0 + self.metric_gain * x_unit
         return torch.clamp(metric, min=self.metric_min, max=self.metric_max)
-
+    
     def metric_for_update(self, metric_raw: Any, x_unit: Any) -> Any:
         raw_signal = self.raw_metric_signal(metric_raw.detach())
         if self.norm(raw_signal) <= 1e-12:
@@ -629,7 +754,7 @@ class SubRiemannianLora(ContrastiveLora):
     def metric_from_signal(self, signal: Any) -> Any:
         import torch
 
-        metric = 1.0 + self.metric_gain * signal.abs()
+        metric = 1.0 + self.metric_gain * signal
         return torch.clamp(metric, min=self.metric_min, max=self.metric_max)
 
     def raw_metric_signal(self, metric_raw: Any) -> Any:
@@ -643,7 +768,7 @@ class SubRiemannianLora(ContrastiveLora):
         metric_raw = module.sr_metric_raw
         raw_signal = self.raw_metric_signal(metric_raw)
         learned_unit = self.l2_normalize_signed(raw_signal)
-        unbounded_metric = 1.0 + self.metric_gain * learned_unit.abs()
+        unbounded_metric = 1.0 + self.metric_gain * learned_unit
         fit_loss = (learned_unit - x_unit).pow(2).mean()
         identity_loss = (unbounded_metric - 1.0).pow(2).mean()
         bound_loss = F.relu(self.metric_min - unbounded_metric).pow(2).mean()
